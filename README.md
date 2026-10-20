@@ -50,7 +50,7 @@ so behavior is identical across every game.
 ### 1. Vendor the repo (git submodule)
 
 ```sh
-git submodule add https://github.com/mstan/recomp-ui.git recomp-ui
+git submodule add https://github.com/magnopaz/recomp-ui.git recomp-ui
 ```
 
 ### 2. Wire it into your CMake target

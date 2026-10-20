@@ -131,7 +131,7 @@ predates the field sends none, and its guest falls back to 1, which is what
 such a host launches with. (Until 2026-09-25 every LAN match was session 1.)
 
 For the engine-side checklist see snesrecomp
-[`docs/RECOMP_NET.md`](https://github.com/mstan/snesrecomp/blob/main/docs/RECOMP_NET.md)
+[`docs/RECOMP_NET.md`](https://github.com/magnopaz/snesrecomp/blob/main/docs/RECOMP_NET.md)
 → "Soft-return rematch checklist".
 
 ---
