@@ -1,6 +1,9 @@
 #include "recomp_runtime_ui.h"
 #include "imgui.h"
 #include "imgui_internal.h"
+/* Include the production drawer to drive its item/section mouse seams directly,
+ * without depending on the outer menu's pixel layout. */
+#include "../src/common/backends/imgui/runtime_ui_imgui.cpp"
 
 #include <cassert>
 #include <cmath>
@@ -139,9 +142,176 @@ void toast_case() {
     recomp_runtime_ui_destroy(ui);
 }
 
+ImVec2 nested_frame(RecompRuntimeUi *ui, bool sections = false) {
+    ImGui::NewFrame();
+    ImGui::SetNextWindowPos(ImVec2(20, 20));
+    ImGui::SetNextWindowSize(ImVec2(600, 400));
+    ImGui::Begin("nested mouse test");
+    const LauncherTheme theme = launcher_theme_default();
+    if (sections) draw_sections(ui, theme, false);
+    else draw_items(ui, theme, false);
+    const ImRect last = GImGui->LastItemData.Rect;
+    const ImVec2 center = last.GetCenter();
+    ImGui::End();
+    ImGui::Render();
+    return center;
+}
+
+void nested_mouse_case() {
+    static const RecompRuntimeUiItem items[] = {
+        { "root", "Mods", "Root", nullptr, RECOMP_RUNTIME_UI_BOOL, 0, 1, 1, nullptr, 0, nullptr },
+        { "child", "Mods/Child", "Child item", nullptr, RECOMP_RUNTIME_UI_BOOL, 0, 1, 1, nullptr, 0, nullptr },
+        { "video", "Video", "Video item", nullptr, RECOMP_RUNTIME_UI_BOOL, 0, 1, 1, nullptr, 0, nullptr },
+    };
+    int value = 0;
+    RecompRuntimeUiConfig config{};
+    config.items = items;
+    config.item_count = 3;
+    config.callbacks.context = &value;
+    config.callbacks.get_value = get_value;
+    config.callbacks.set_value = set_value;
+    RecompRuntimeUi *ui = recomp_runtime_ui_create(&config);
+    assert(ui != nullptr);
+    recomp_runtime_ui_open(ui);
+    recomp_runtime_ui_enter_section(ui, 0);
+    ImGui::CreateContext();
+    ImGuiIO &io = ImGui::GetIO();
+    io.IniFilename = nullptr;
+    io.DisplaySize = ImVec2(1280, 720);
+    io.DeltaTime = 1.0f / 60.0f;
+    unsigned char *pixels; int width, height;
+    io.Fonts->GetTexDataAsRGBA32(&pixels, &width, &height);
+
+    nested_frame(ui);
+    const ImVec2 folder = nested_frame(ui);
+    io.AddMousePosEvent(folder.x, folder.y);
+    nested_frame(ui);
+    io.AddMouseButtonEvent(0, true);
+    nested_frame(ui);
+    io.AddMouseButtonEvent(0, false);
+    nested_frame(ui);
+    assert(std::strcmp(ui->page, "Child") == 0);
+    assert(ui->row_index == 0);
+    recomp_runtime_ui_handle_input(ui, RECOMP_RUNTIME_UI_INPUT_ACCEPT, 1, 0);
+    assert(value == 1);  // the only child is immediately usable after the click
+    recomp_runtime_ui_handle_input(ui, RECOMP_RUNTIME_UI_INPUT_BACK, 1, 0);
+    assert(ui->row_index == 1);  // Back still selects the parent folder
+    recomp_runtime_ui_handle_input(ui, RECOMP_RUNTIME_UI_INPUT_ACCEPT, 1, 0);
+    assert(std::strcmp(ui->page, "Child") == 0);
+
+    io.AddMousePosEvent(-100, -100);
+    nested_frame(ui, true);
+    const ImVec2 video = nested_frame(ui, true);
+    io.AddMousePosEvent(video.x, video.y);
+    nested_frame(ui, true);
+    assert(ui->section_index == 1 && ui->page[0] == '\0');
+    assert(ui->page_depth == 0 && ui->row_index == 0 && ui->in_section);
+    recomp_runtime_ui_handle_input(ui, RECOMP_RUNTIME_UI_INPUT_ACCEPT, 1, 0);
+    assert(value == 0);  // Video's root item is usable without backing out
+
+    ImGui::DestroyContext();
+    recomp_runtime_ui_destroy(ui);
+}
+
+// A paused host can redraw much faster than the guest. Confirmation remains
+// usable after a human double-press delay, and still expires after three seconds.
+void confirmation_cadence_case() {
+    static const RecompRuntimeUiItem item = {
+        "quit", "System", "Quit", nullptr, RECOMP_RUNTIME_UI_ACTION,
+        0, 0, 0, nullptr, 0, nullptr };
+    RecompRuntimeUiConfig config{};
+    config.items = &item;
+    config.item_count = 1;
+    RecompRuntimeUi *ui = recomp_runtime_ui_create(&config);
+    recomp_runtime_ui_open(ui);
+    ImGui::CreateContext();
+    ImGuiIO &io = ImGui::GetIO();
+    io.IniFilename = nullptr;
+    io.DisplaySize = ImVec2(1280, 720);
+    unsigned char *pixels; int width, height;
+    io.Fonts->GetTexDataAsRGBA32(&pixels, &width, &height);
+    auto render = [&](int count, float dt) {
+        io.DeltaTime = dt;
+        for (int i = 0; i < count; ++i) {
+            ImGui::NewFrame();
+            recomp_runtime_ui_render_imgui(ui);
+            ImGui::Render();
+        }
+    };
+    assert(!recomp_runtime_ui_confirm(ui, &item, "Press again to quit"));
+    render(240, 0.001f);
+    assert(recomp_runtime_ui_confirm(ui, &item, "Press again to quit"));
+    assert(!recomp_runtime_ui_confirm(ui, &item, "Press again to quit"));
+    render(31, 0.1f);
+    assert(!recomp_runtime_ui_confirm(ui, &item, "Press again to quit"));
+    ImGui::DestroyContext();
+    recomp_runtime_ui_destroy(ui);
+}
+
+void footer_case(ImVec2 display, uint32_t flags) {
+    static const RecompRuntimeUiItem item = {
+        "disc", "Disc", "Selected disc", "Choose a disc.",
+        RECOMP_RUNTIME_UI_INT, 1, 4, 1, nullptr, 0, nullptr };
+    int value = 1;
+    RecompRuntimeUiConfig config{};
+    config.title = "Game menu";
+    config.items = &item;
+    config.item_count = 1;
+    config.accept_label = "Enter / Cross";
+    config.back_label = "Esc / Circle";
+    config.callbacks.context = &value;
+    config.callbacks.get_value = get_value;
+    config.callbacks.set_value = set_value;
+    config.presentation_flags = flags;
+    RecompRuntimeUi *ui = recomp_runtime_ui_create(&config);
+    recomp_runtime_ui_open(ui);
+    recomp_runtime_ui_set_status(ui, "Could not open that disc. Check its image files and try again.");
+    ImGui::CreateContext();
+    ImGuiIO &io = ImGui::GetIO();
+    io.IniFilename = nullptr;
+    io.DisplaySize = display;
+    io.DeltaTime = 1.0f / 60.0f;
+    ImFontConfig font;
+    font.SizePixels = 18.0f;
+    io.Fonts->AddFontDefault(&font);
+    unsigned char *pixels; int w, h;
+    io.Fonts->GetTexDataAsRGBA32(&pixels, &w, &h);
+    for (int frame = 0; frame < 3; ++frame) {
+        ImGui::NewFrame();
+        recomp_runtime_ui_render_imgui(ui);
+        ImGui::Render();
+    }
+    ImGuiWindow *menu = ImGui::FindWindowByName("##recomp-runtime-ui");
+    ImGuiWindow *footer = nullptr;
+    for (ImGuiWindow *window : ImGui::GetCurrentContext()->Windows)
+        if (window->ParentWindow == menu && std::strstr(window->Name, "##footer")) footer = window;
+    assert(footer && menu);
+    /* Hints and status fit vertically and leave a usable button region. */
+    assert(footer->Pos.x + footer->Size.x <= menu->InnerRect.Max.x - 70.0f);
+    assert(footer->Pos.y + footer->Size.y <= menu->InnerRect.Max.y + 1.0f);
+    assert(footer->ScrollMax.y < 1.0f);
+    const ImVec2 resume(menu->WorkRect.Max.x - 20.0f, footer->Pos.y + 10.0f);
+    io.AddMousePosEvent(resume.x, resume.y);
+    for (int frame = 0; frame < 3; ++frame) {
+        if (frame == 1) io.AddMouseButtonEvent(0, true);
+        if (frame == 2) io.AddMouseButtonEvent(0, false);
+        ImGui::NewFrame();
+        recomp_runtime_ui_render_imgui(ui);
+        ImGui::Render();
+    }
+    assert(!recomp_runtime_ui_is_open(ui));
+    ImGui::DestroyContext();
+    recomp_runtime_ui_destroy(ui);
+}
+
 } // namespace
 
 int main() {
+    footer_case(ImVec2(640, 480), 0);
+    footer_case(ImVec2(1280, 720), 0);
+    footer_case(ImVec2(1200, 900), RECOMP_RUNTIME_UI_PRESENTATION_TOUCH_FRIENDLY);
+    confirmation_cadence_case();
+    nested_mouse_case();
     toast_case();
     render_case(0, ImVec2(1280.0f, 720.0f), 779.0f, 671.0f, 781.0f);
     render_case(RECOMP_RUNTIME_UI_PRESENTATION_TOUCH_FRIENDLY,

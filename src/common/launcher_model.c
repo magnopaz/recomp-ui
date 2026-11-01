@@ -12,6 +12,7 @@
 #include "sha1.h"
 #include "ips_patch.h"
 
+#include <stdarg.h>
 #include <stdio.h>
 #include <ctype.h>
 #include <stdlib.h>
@@ -348,11 +349,27 @@ static int lm_load_cached_rom_path(const RecompLauncherCGameInfo* game,
     return 0;
 }
 
+#if defined(_WIN32)
+/* windows/recomp_utf8.manifest makes narrow paths UTF-8 to match the pickers.
+ * Windows older than 10 1903 ignores it; say so once, because a non-ASCII
+ * path then fails in ways that otherwise look unrelated. */
+static void lm_warn_non_utf8_code_page(void) {
+    static int warned;
+    if (warned || GetACP() == CP_UTF8) return;
+    warned = 1;
+    fprintf(stderr, "[launcher] process code page is %u, not UTF-8; paths with "
+                    "non-ASCII characters may not open\n", (unsigned)GetACP());
+}
+#endif
+
 void launcher_model_init(LauncherModel* m,
                          const RecompLauncherCSettings* io,
                          const RecompLauncherCGameInfo* game,
                          const char* initial_rom) {
     memset(m, 0, sizeof(*m));
+#if defined(_WIN32)
+    lm_warn_non_utf8_code_page();
+#endif
 
     if (game) {
         m->game_name            = game->name ? game->name : "Unknown Game";
@@ -385,6 +402,11 @@ void launcher_model_init(LauncherModel* m,
         m->known_sha1_hex       = game->known_sha1_hex;
         m->num_known_sha1       = game->num_known_sha1;
         m->num_known_sha256     = game->num_known_sha256;
+        m->rom_revisions        = game->num_rom_revisions > 0 ? game->rom_revisions : NULL;
+        m->num_rom_revisions    = m->rom_revisions ? game->num_rom_revisions : 0;
+        m->rom_help             = game->rom_help;
+        m->rom_describe         = game->rom_describe;
+        m->rom_describe_ctx     = game->rom_describe_ctx;
 
         m->pad_mode_supported   = game->pad_mode_supported != 0;
         m->pad_mode_selectable  = game->pad_mode_selectable != 0;
@@ -397,6 +419,12 @@ void launcher_model_init(LauncherModel* m,
         m->has_supersampling    = game->has_supersampling != 0;
         m->has_antialiasing     = game->has_antialiasing != 0;
         m->has_texture_filter   = game->has_texture_filter != 0;
+        if (game->texture_filter_labels && game->texture_filter_values &&
+            game->num_texture_filters > 0) {
+            m->texture_filter_labels = game->texture_filter_labels;
+            m->texture_filter_values = game->texture_filter_values;
+            m->num_texture_filters = game->num_texture_filters;
+        }
         m->has_fmv_filter       = game->has_fmv_filter != 0;
         m->has_screen_kind      = game->has_screen_kind != 0;
         m->has_scanlines        = game->has_scanlines != 0;
@@ -409,7 +437,6 @@ void launcher_model_init(LauncherModel* m,
         m->has_vsync            = game->has_vsync != 0;
         m->has_skip_fmv         = game->has_skip_fmv != 0;
         m->has_turbo_loads      = game->has_turbo_loads != 0;
-        m->has_geometry_precision = game->has_geometry_precision != 0;
         // game->has_fullscreen_toggle is deliberately NOT read: the Fullscreen
         // row is universal (drawn for every console) — see recomp_launcher.h.
         m->has_bios             = game->has_bios != 0;
@@ -541,6 +568,8 @@ void launcher_model_init(LauncherModel* m,
                                       m->assist_fast_forward_min
             ? game->assist_fast_forward_max
             : m->assist_fast_forward_min;
+        m->assist_fast_forward_divisor = game->assist_fast_forward_divisor > 0 &&
+            game->assist_fast_forward_divisor <= 1000 ? game->assist_fast_forward_divisor : 1;
         m->tpak_slots           = clampi(game->tpak_slots, 0, RECOMP_LAUNCHER_MAX_TPAKS);
         m->tpak_inspect_cb      = game->tpak_inspect;
         m->audio_device_labels  = game->audio_device_labels;
@@ -552,15 +581,8 @@ void launcher_model_init(LauncherModel* m,
         m->internal_resolution_values = game->internal_resolution_values;
         m->num_internal_resolutions   = game->num_internal_resolutions;
         m->internal_resolution_note   = game->internal_resolution_note;
-        m->has_dynamic_resolution      = game->has_dynamic_resolution != 0;
         m->has_render_pipeline         = game->has_render_pipeline != 0;
-        m->quality_offered_mask        = game->quality_offered_mask;
-        m->quality_detected            = game->quality_detected;
-        m->quality_summary             = game->quality_summary;
-        m->quality_reason              = game->quality_reason;
-        m->quality_apply               = game->quality_apply;
-        m->quality_redetect            = game->quality_redetect;
-        m->quality_snapshot_valid      = false;
+        m->linear_filter_hidden        = game->linear_filter_hidden != 0;
         m->renderer_note        = game->renderer_note;
         m->hide_rebind          = game->hide_rebind != 0;
         m->has_mouse_controls   = game->has_mouse_controls != 0;
@@ -626,6 +648,7 @@ void launcher_model_init(LauncherModel* m,
     m->s.rom_patch_source_path[0] = '\0';
     m->s.rom_patch_sha1[0] = '\0';
     m->s.rom_patch_crc32[0] = '\0';
+    m->s.fast_forward_toggle_mode = m->s.fast_forward_toggle_mode ? 1 : 0;
     m->s.assist_fast_forward_multiplier = clampi(
         m->s.assist_fast_forward_multiplier > 0
             ? m->s.assist_fast_forward_multiplier
@@ -700,11 +723,9 @@ void launcher_model_init(LauncherModel* m,
      * Online start is always lobby SFU (§108). */
     m->netplay_force_input_relay = false;
     m->netplay_force_turn = false;
-    /* Online matches always negotiate with ICE (STUN, then TURN), so nobody
-     * has to forward a port. The host relay needs a reachable UDP port and
-     * has no fallback, so the launcher no longer offers it. */
-    m->netplay_relay_host = false;
-    m->netplay_relay_via_ice = true;
+    /* Online matches always negotiate with ICE (STUN, then TURN), and the
+     * host carries the match over it, so nobody forwards a port. There is no
+     * model state for it: it is not a setting. */
     m->netplay_relay_status[0] = '\0';
     /* Rollback is the legacy default; a title may choose delay-sync for the
      * initial room size through create_default_rollback below. */
@@ -845,7 +866,7 @@ void launcher_model_init(LauncherModel* m,
                      ? sk_prof->screen_kind_count : 4;
         m->s.screen_kind = clampi(m->s.screen_kind, 0, sk_n - 1);
     }
-    if (m->has_texture_filter) m->s.texture_filter = m->s.texture_filter ? 1 : 0;
+    if (m->has_texture_filter) m->s.texture_filter = launcher_model_normalize_texture_filter(m, m->s.texture_filter);
     /* 0 = unset (a host predating the field): seed the default rather than
      * letting a memset pin the least useful value. */
     if (m->has_fmv_filter) {
@@ -912,10 +933,13 @@ void launcher_model_init(LauncherModel* m,
     {
         char cached_rom[1024];
         const char* seeded_rom = initial_rom;
-        if (lm_load_cached_rom_path(game, initial_rom, cached_rom,
+        if ((!game || !game->disc_selection_locked) && lm_load_cached_rom_path(game, initial_rom, cached_rom,
                                     sizeof(cached_rom)))
             seeded_rom = cached_rom;
         launcher_model_set_rom(m, seeded_rom);
+        m->disc_selection_locked=game && game->disc_selection_locked;
+        m->artwork_root=game?game->artwork_root:NULL;
+        m->dashboard_quick_controls=game && game->dashboard_quick_controls;
     }
 
     // Password/mantra save: read the current one-line password file so the
@@ -1303,7 +1327,250 @@ int launcher_model_autofill_sibling_discs(LauncherModel* m) {
     return filled;
 }
 
+/* ---- cartridge ROM identification -------------------------------------- */
+
+static void lm_appendf(char* out, size_t cap, const char* fmt, ...) {
+    size_t len = strlen(out);
+    if (len + 1 >= cap) return;
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(out + len, cap - len, fmt, ap);
+    va_end(ap);
+}
+
+/* Full-length, case-insensitive hex comparison; an empty `want` never matches. */
+static bool lm_hex_equal(const char* have, const char* want) {
+    if (!have || !want || !want[0]) return false;
+    size_t i = 0;
+    for (; have[i] && want[i]; ++i)
+        if (tolower((unsigned char)have[i]) != tolower((unsigned char)want[i]))
+            return false;
+    return have[i] == '\0' && want[i] == '\0';
+}
+
+static bool lm_revision_matches(const RecompLauncherCRomRevision* r,
+                                const char* sha256, const char* sha1,
+                                const char* crc) {
+    int given = 0;
+    if (r->sha256_hex && r->sha256_hex[0]) {
+        ++given;
+        if (!lm_hex_equal(sha256, r->sha256_hex)) return false;
+    }
+    if (r->sha1_hex && r->sha1_hex[0]) {
+        ++given;
+        if (!lm_hex_equal(sha1, r->sha1_hex)) return false;
+    }
+    if (r->crc32_hex && r->crc32_hex[0]) {
+        ++given;
+        if (!lm_hex_equal(crc, r->crc32_hex)) return false;
+    }
+    return given > 0;
+}
+
+/* Archive containers players pick in place of the ROM inside them. */
+static const char* lm_archive_kind(const uint8_t* d, size_t n) {
+    if (n >= 4 && d[0] == 'P' && d[1] == 'K' &&
+        ((d[2] == 3 && d[3] == 4) || (d[2] == 5 && d[3] == 6) ||
+         (d[2] == 7 && d[3] == 8)))
+        return "ZIP";
+    if (n >= 6 && memcmp(d, "7z\xBC\xAF\x27\x1C", 6) == 0) return "7-Zip";
+    if (n >= 6 && memcmp(d, "Rar!\x1A\x07", 6) == 0) return "RAR";
+    if (n >= 2 && d[0] == 0x1F && d[1] == 0x8B) return "gzip";
+    return NULL;
+}
+
+static bool lm_has_supported_revision(const LauncherModel* m) {
+    for (int i = 0; i < m->num_rom_revisions; ++i)
+        if (m->rom_revisions[i].supported) return true;
+    return false;
+}
+
+/* What this build accepts: each supported catalog entry with its strongest
+ * digest, else the legacy fingerprint the game was built from. */
+static void lm_rom_requirement(const LauncherModel* m, char* out, size_t cap) {
+    out[0] = '\0';
+    int listed = 0;
+    for (int i = 0; i < m->num_rom_revisions; ++i) {
+        const RecompLauncherCRomRevision* r = &m->rom_revisions[i];
+        if (!r->supported) continue;
+        lm_appendf(out, cap, "%s%s", listed ? " or " : "",
+                   r->label && r->label[0] ? r->label : "the supported ROM");
+        if (r->sha256_hex && r->sha256_hex[0])
+            lm_appendf(out, cap, " (SHA-256 %s)", r->sha256_hex);
+        else if (r->sha1_hex && r->sha1_hex[0])
+            lm_appendf(out, cap, " (SHA-1 %s)", r->sha1_hex);
+        else if (r->crc32_hex && r->crc32_hex[0])
+            lm_appendf(out, cap, " (CRC32 %s)", r->crc32_hex);
+        ++listed;
+    }
+    if (listed) return;
+    if (m->num_known_sha256 > 0 && m->known_sha256) {
+        lm_appendf(out, cap, "the ROM it was built from (SHA-256 ");
+        for (int b = 0; b < 32; ++b)
+            lm_appendf(out, cap, "%02x", m->known_sha256[0][b]);
+        lm_appendf(out, cap, ")");
+    } else if (m->num_known_sha1 > 0 && m->known_sha1_hex && m->known_sha1_hex[0]) {
+        lm_appendf(out, cap, "the ROM it was built from (SHA-1 %s)",
+                   m->known_sha1_hex[0]);
+    } else if (m->has_expected_crc) {
+        lm_appendf(out, cap, "the ROM it was built from (CRC32 %08X)",
+                   (unsigned)m->expected_crc);
+    }
+}
+
+static void lm_set_rom_unreadable(LauncherModel* m, const char* why) {
+    m->rom_verdict = LNG_ROM_UNREADABLE;
+    safe_copy(m->rom_detail, sizeof(m->rom_detail), why);
+}
+
+/* Fingerprint the picked cartridge image and explain the result: verified,
+ * a known dump this build does not run (named), an archive, or unknown. */
+static void lm_identify_rom(LauncherModel* m, const uint8_t* buf, size_t n) {
+    /* Normalize container headers before fingerprinting.
+     * SNES .smc images may carry a 512-byte copier header;
+     * NES .nes images carry a 16-byte iNES/NES 2.0 header.
+     * NESRecomp's ROM and package CRCs intentionally cover
+     * every byte after that 16-byte header. */
+    size_t hdr = (n % 1024 == 512) ? 512 : 0;
+    if (n > 16 && buf[0] == 'N' && buf[1] == 'E' &&
+        buf[2] == 'S' && buf[3] == 0x1A) {
+        hdr = 16;
+    }
+    const uint8_t* body = buf + hdr;
+    size_t blen = n - hdr;
+    uint32_t crc = recompui_crc32_compute(body, blen);
+    uint8_t  sha[32], s1[20];
+    char     s1hex[41];
+    recompui_sha256_compute(body, blen, sha);
+    recompui_sha1_compute(body, blen, s1);
+    recompui_sha1_hex(s1, s1hex);
+    for (int b = 0; b < 32; ++b)
+        snprintf(m->rom_sha256_hex + b * 2, 3, "%02x", sha[b]);
+    snprintf(m->rom_crc32_hex, sizeof(m->rom_crc32_hex), "%08X", (unsigned)crc);
+    safe_copy(m->rom_sha1_hex, sizeof(m->rom_sha1_hex), s1hex);
+
+    m->crc_match = m->has_expected_crc && crc == m->expected_crc;
+    for (size_t k = 0; k < m->num_known_sha256; ++k)
+        if (memcmp(sha, m->known_sha256[k], 32) == 0) {
+            m->sha_match = true;
+            break;
+        }
+    /* SHA-1: cartridge identity gate (GBA/SNES). */
+    for (size_t k = 0; m->known_sha1_hex && k < m->num_known_sha1; ++k)
+        if (lm_hex_equal(s1hex, m->known_sha1_hex[k])) {
+            m->sha1_match = true;
+            break;
+        }
+
+    /* A supported entry outranks an unsupported one with the same digests. */
+    const RecompLauncherCRomRevision* hit = NULL;
+    for (int i = 0; i < m->num_rom_revisions; ++i) {
+        const RecompLauncherCRomRevision* r = &m->rom_revisions[i];
+        if (!lm_revision_matches(r, m->rom_sha256_hex, s1hex, m->rom_crc32_hex))
+            continue;
+        if (!hit || (r->supported && !hit->supported)) hit = r;
+    }
+    if (hit && hit->label)
+        safe_copy(m->rom_identified, sizeof(m->rom_identified), hit->label);
+
+    const bool legacy_fp = m->has_expected_crc || m->num_known_sha256 > 0 ||
+                           m->num_known_sha1 > 0;
+    const bool legacy_ok = legacy_fp &&
+                           (!m->has_expected_crc || m->crc_match) &&
+                           (!m->num_known_sha256 || m->sha_match) &&
+                           (!m->num_known_sha1 || m->sha1_match);
+    if (legacy_ok || (hit && hit->supported)) {
+        m->rom_verdict = LNG_ROM_VERIFIED;
+        return;
+    }
+    /* Only after the digests disagree: a ROM may begin with any bytes. */
+    const char* archive = hit ? NULL : lm_archive_kind(buf, n);
+    if (archive) {
+        const char* noun = (m->rom_noun && m->rom_noun[0]) ? m->rom_noun : "ROM";
+        m->rom_verdict = LNG_ROM_ARCHIVE;
+        snprintf(m->rom_detail, sizeof(m->rom_detail),
+                 "This is a %s archive, not a %s. Extract it first, then "
+                 "select the %s file that was inside.", archive, noun, noun);
+        return;
+    }
+    if (!legacy_fp && !lm_has_supported_revision(m)) {
+        m->rom_verdict = LNG_ROM_UNCHECKED;
+        return;
+    }
+
+    char need[640];
+    lm_rom_requirement(m, need, sizeof(need));
+    const char* game = m->game_name && m->game_name[0] ? m->game_name : "This game";
+    if (hit) {
+        m->rom_verdict = LNG_ROM_WRONG;
+        snprintf(m->rom_detail, sizeof(m->rom_detail), "This is %s. %s needs %s.",
+                 hit->label && hit->label[0] ? hit->label : "a different ROM",
+                 game, need);
+        if (hit->note && hit->note[0])
+            lm_appendf(m->rom_detail, sizeof(m->rom_detail), " %s", hit->note);
+    } else {
+        /* The file's own digests stay in Copy details; the panel says what
+         * the file looks like and what to get instead. */
+        char seen[256] = "";
+        m->rom_verdict = LNG_ROM_UNRECOGNIZED;
+        if (m->rom_describe &&
+            m->rom_describe(m->rom_describe_ctx, body, blen, seen, sizeof(seen)) &&
+            seen[0])
+            snprintf(m->rom_detail, sizeof(m->rom_detail),
+                     "This file matches no known dump. %s %s needs %s.",
+                     seen, game, need);
+        else
+            snprintf(m->rom_detail, sizeof(m->rom_detail),
+                     "This file matches no known dump: it may be another "
+                     "revision or region, a hack, a translation or a bad dump. "
+                     "%s needs %s.", game, need);
+    }
+    if (m->rom_help && m->rom_help[0])
+        lm_appendf(m->rom_detail, sizeof(m->rom_detail), " %s", m->rom_help);
+}
+
+bool launcher_model_rom_has_fingerprint(const LauncherModel* m) {
+    return m && (m->has_expected_crc || m->num_known_sha256 > 0 ||
+                 m->num_known_sha1 > 0 || lm_has_supported_revision(m));
+}
+
+void launcher_model_rom_headline(const LauncherModel* m, char* out, size_t cap) {
+    const char* noun = (m->rom_noun && m->rom_noun[0]) ? m->rom_noun : "ROM";
+    const char* fmt = m->rom_present ? "%s not recognized" : "No %s loaded";
+    switch (m->rom_verdict) {
+    case LNG_ROM_VERIFIED:     fmt = "%s verified"; break;
+    case LNG_ROM_UNCHECKED:    fmt = "%s not verified"; break;
+    case LNG_ROM_WRONG:        fmt = "Wrong %s"; break;
+    case LNG_ROM_UNRECOGNIZED: fmt = "%s not recognized"; break;
+    case LNG_ROM_ARCHIVE:      fmt = "Archive, not a %s"; break;
+    case LNG_ROM_UNREADABLE:   fmt = "%s unreadable"; break;
+    case LNG_ROM_NONE:         break;
+    }
+    snprintf(out, cap, fmt, noun);
+}
+
+int launcher_model_rom_report(const LauncherModel* m, char* out, size_t cap) {
+    if (!out || cap == 0) return 0;
+    out[0] = '\0';
+    char need[640], headline[64];
+    lm_rom_requirement(m, need, sizeof(need));
+    launcher_model_rom_headline(m, headline, sizeof(headline));
+    lm_appendf(out, cap, "%s: %s\n", m->game_name ? m->game_name : "", headline);
+    lm_appendf(out, cap, "File: %s\n", m->rom_present ? m->rom_full : "(none)");
+    if (m->rom_sha256_hex[0]) {
+        lm_appendf(out, cap, "SHA-256: %s\n", m->rom_sha256_hex);
+        lm_appendf(out, cap, "SHA-1: %s\n", m->rom_sha1_hex);
+        lm_appendf(out, cap, "CRC32: %s\n", m->rom_crc32_hex);
+    }
+    if (m->rom_identified[0])
+        lm_appendf(out, cap, "Identified as: %s\n", m->rom_identified);
+    if (need[0]) lm_appendf(out, cap, "Required: %s\n", need);
+    if (m->rom_detail[0]) lm_appendf(out, cap, "%s\n", m->rom_detail);
+    return (int)strlen(out);
+}
+
 void launcher_model_set_rom(LauncherModel* m, const char* path) {
+    if(m->disc_selection_locked && (!path || strcmp(path,m->rom_full)!=0))return;
     if (lm_is_sbi_path(path)) {
         char mounted[sizeof(m->rom_full)] = {0};
         m->setup_error[0] = '\0';
@@ -1339,9 +1606,15 @@ void launcher_model_set_rom(LauncherModel* m, const char* path) {
     m->crc_match = false;
     m->sha_match = false;
     m->sha1_match = false;
+    m->rom_verdict = LNG_ROM_NONE;
+    m->rom_sha256_hex[0] = '\0';
+    m->rom_crc32_hex[0] = '\0';
+    m->rom_identified[0] = '\0';
+    m->rom_detail[0] = '\0';
     const int disc_verify = m->profile && m->profile->verify.mode == 1;
     if (m->rom_present) {
         FILE* f = fopen(m->rom_full, "rb");
+        const bool opened = f != NULL;
         if (f) {
             fseek(f, 0, SEEK_END);
             long n = ftell(f);
@@ -1351,57 +1624,19 @@ void launcher_model_set_rom(LauncherModel* m, const char* path) {
                 if (!disc_verify) {
                     fseek(f, 0, SEEK_SET);
                     uint8_t* buf = (uint8_t*)malloc((size_t)n);
-                    if (buf && fread(buf, 1, (size_t)n, f) == (size_t)n) {
-                        /* Normalize container headers before fingerprinting.
-                         * SNES .smc images may carry a 512-byte copier header;
-                         * NES .nes images carry a 16-byte iNES/NES 2.0 header.
-                         * NESRecomp's ROM and package CRCs intentionally cover
-                         * every byte after that 16-byte header. */
-                        size_t hdr = ((size_t)n % 1024 == 512) ? 512 : 0;
-                        if ((size_t)n > 16 &&
-                            buf[0] == 'N' && buf[1] == 'E' &&
-                            buf[2] == 'S' && buf[3] == 0x1A) {
-                            hdr = 16;
-                        }
-                        const uint8_t* body = buf + hdr;
-                        size_t blen = (size_t)n - hdr;
-                        uint32_t crc = recompui_crc32_compute(body, blen);
-                        uint8_t  sha[32];
-                        recompui_sha256_compute(body, blen, sha);
-                        m->crc_match = m->has_expected_crc && crc == m->expected_crc;
-                        for (size_t k = 0; k < m->num_known_sha256; ++k)
-                            if (memcmp(sha, m->known_sha256[k], 32) == 0) {
-                                m->sha_match = true;
-                                break;
-                            }
-                        /* SHA-1: cartridge identity gate (GBA/SNES). */
-                        if (m->num_known_sha1 && m->known_sha1_hex) {
-                            uint8_t s1[20]; char s1hex[41];
-                            recompui_sha1_compute(body, blen, s1);
-                            recompui_sha1_hex(s1, s1hex);
-                            safe_copy(m->rom_sha1_hex,
-                                      sizeof(m->rom_sha1_hex), s1hex);
-                            for (size_t k = 0; k < m->num_known_sha1; ++k) {
-                                const char* want = m->known_sha1_hex[k];
-                                if (!want) continue;
-                                int eq = 1;
-                                for (int c = 0; c < 40 && eq; ++c) {
-                                    char a = s1hex[c], b = want[c];
-                                    if (b >= 'A' && b <= 'Z') b = (char)(b + 32);
-                                    if (a != b) eq = 0;
-                                }
-                                if (eq && want[40] == '\0') {
-                                    m->sha1_match = true;
-                                    break;
-                                }
-                            }
-                        }
-                    }
+                    if (buf && fread(buf, 1, (size_t)n, f) == (size_t)n)
+                        lm_identify_rom(m, buf, (size_t)n);
+                    else
+                        lm_set_rom_unreadable(m, "This file could not be read.");
                     free(buf);
                 }
             }
             fclose(f);
         }
+        if (!disc_verify && m->rom_verdict == LNG_ROM_NONE)
+            lm_set_rom_unreadable(m, !opened ? "This file could not be opened. "
+                                               "It may have been moved or deleted."
+                                             : "This file is empty.");
     }
     if (!m->rom_size[0]) safe_copy(m->rom_size, sizeof(m->rom_size), "--");
 
@@ -1430,6 +1665,10 @@ static void run_verify(LauncherModel* m) {
     if (m->disc_verify_cb && m->rom_present) {
         RecompLauncherCDiscVerify dv; memset(&dv, 0, sizeof(dv));
         if (m->disc_verify_cb(m->rom_full, &dv)) {
+            if (dv.profile_handoff) {
+                m->profile_handoff = true;
+                m->action = LNG_ACTION_QUIT;
+            }
             safe_copy(m->verify.serial, sizeof(m->verify.serial), dv.serial);
             safe_copy(m->verify.region, sizeof(m->verify.region), dv.region);
             m->verify.iso_ok  = dv.iso_ok != 0;
@@ -1474,15 +1713,7 @@ const char* launcher_model_effective_rom_path(const LauncherModel* m) {
 }
 
 bool launcher_model_rom_verified(const LauncherModel* m) {
-    if (!m->rom_present) return false;
-    const int has_crc  = m->has_expected_crc;
-    const int has_sha  = m->num_known_sha256 > 0;
-    const int has_sha1 = m->num_known_sha1 > 0;
-    if (!has_crc && !has_sha && !has_sha1) return false;   // no fingerprint => can't vouch
-    if (has_crc  && !m->crc_match)  return false;
-    if (has_sha  && !m->sha_match)  return false;
-    if (has_sha1 && !m->sha1_match) return false;
-    return true;
+    return m->rom_present && m->rom_verdict == LNG_ROM_VERIFIED;
 }
 
 void launcher_model_set_view(LauncherModel* m, LngView v) {
@@ -1925,6 +2156,26 @@ void launcher_model_set_vsync(LauncherModel* m, int value) {
     m->s.vsync = value;
 }
 
+/* The enabled feature that overrides the VSync row, as the mod provider
+ * reports it. The saved Settings.vsync is left alone: it applies again once
+ * that feature is off. */
+const char* launcher_model_vsync_forced_off_by(const LauncherModel* m) {
+    static char name[128];
+    if (!m || !m->mods || !m->mods->feature_count || !m->mods->feature_get)
+        return NULL;
+    const int n = m->mods->feature_count(m->mods->ctx);
+    for (int i = 0; i < n; ++i) {
+        RecompLauncherCModFeature f;
+        memset(&f, 0, sizeof f);
+        if (!m->mods->feature_get(m->mods->ctx, i, &f) || !f.enabled ||
+            !f.forces_vsync_off)
+            continue;
+        snprintf(name, sizeof name, "%s", f.name[0] ? f.name : f.id);
+        return name;
+    }
+    return NULL;
+}
+
 const char* launcher_model_renderer_label(const LauncherModel* m) {
     if (m->renderer_ids)
         return launcher_model_renderer_label_at(m, m->s.renderer);
@@ -1947,71 +2198,6 @@ void launcher_model_cycle_supersampling(LauncherModel* m) {
 
 bool launcher_model_render_pipeline_offered(const LauncherModel* m) {
     return m && m->has_render_pipeline && m->s.renderer == 1;
-}
-
-bool launcher_model_quality_offered(const LauncherModel* m) {
-    return m && (m->quality_offered_mask & 0xF) != 0 && m->quality_apply != NULL;
-}
-
-const char* launcher_model_quality_label(int preset) {
-    static const char* const k[] = {"", "Low", "Medium", "High", "Ultra", "Custom"};
-    return (preset >= 0 && preset <= 5) ? k[preset] : "";
-}
-
-/* The Settings fields a preset may set. A field the host's preset leaves
- * alone simply keeps its value in the snapshot, so comparing all of them is
- * exact. */
-static bool quality_fields_equal(const RecompLauncherCSettings* a,
-                                 const RecompLauncherCSettings* b) {
-    return a->internal_resolution == b->internal_resolution &&
-           a->supersampling == b->supersampling &&
-           a->dynamic_resolution == b->dynamic_resolution &&
-           a->dynamic_resolution_min == b->dynamic_resolution_min &&
-           a->render_thread == b->render_thread &&
-           a->present_thread == b->present_thread &&
-           a->frame_generation == b->frame_generation &&
-           a->antialiasing == b->antialiasing &&
-           a->texture_filter == b->texture_filter &&
-           a->fmv_filter == b->fmv_filter &&
-           a->geometry_correction == b->geometry_correction &&
-           a->perspective_texturing == b->perspective_texturing &&
-           a->frame_interp == b->frame_interp &&
-           a->frame_interp_fps == b->frame_interp_fps;
-}
-
-void launcher_model_quality_select(LauncherModel* m, int preset) {
-    if (!launcher_model_quality_offered(m) || preset < 1 || preset > 4) return;
-    if (!(m->quality_offered_mask & (1 << (preset - 1)))) return;
-    m->quality_apply(preset, &m->s);
-    m->s.quality_preset = preset;
-    m->s.quality_base = preset;
-    m->quality_snapshot = m->s;
-    m->quality_snapshot_valid = true;
-}
-
-void launcher_model_quality_redetect(LauncherModel* m) {
-    if (!launcher_model_quality_offered(m) || !m->quality_redetect) return;
-    const int p = m->quality_redetect();
-    if (p >= 1 && p <= 4) {
-        m->quality_detected = p;
-        launcher_model_quality_select(m, p);
-    }
-}
-
-void launcher_model_quality_track(LauncherModel* m) {
-    if (!launcher_model_quality_offered(m)) return;
-    const int q = m->s.quality_preset;
-    if (q < 1 || q > 4) return;
-    if (!m->quality_snapshot_valid) {
-        /* The host seeded the settings with this preset in force. */
-        m->quality_snapshot = m->s;
-        m->quality_snapshot_valid = true;
-        return;
-    }
-    if (!quality_fields_equal(&m->s, &m->quality_snapshot)) {
-        m->s.quality_base = q;
-        m->s.quality_preset = 5;
-    }
 }
 
 bool launcher_model_render_pipeline_children_enabled(const LauncherModel* m) {
@@ -2064,6 +2250,37 @@ void launcher_model_apply_internal_resolution_settings(LauncherModel* m) {
         m->s.internal_resolution = m->internal_resolution_values[0];
 }
 
+/* One scratch model for launcher_model_each_cycle_label: the launcher model is
+ * ~60 KB, too big for the stack of a draw call, and the launcher draws on one
+ * thread. */
+static LauncherModel s_cycle_probe;
+
+int launcher_model_each_cycle_label(const LauncherModel* m,
+                                    void (*cycle)(LauncherModel*),
+                                    const char* (*label)(const LauncherModel*),
+                                    void (*visit)(const char* label, void* ctx),
+                                    void* ctx) {
+    if (!m || !cycle || !label || !visit) return 0;
+    /* Labels are copied out at once: several label functions format into one
+     * static buffer that the next call overwrites. */
+    static char seen[LNG_CYCLE_LABELS_MAX][64];
+    int n = 0;
+    s_cycle_probe = *m;
+    for (int step = 0; step < LNG_CYCLE_LABELS_MAX; ++step) {
+        const char* l = label(&s_cycle_probe);
+        if (!l) l = "";
+        int repeat = 0;
+        for (int i = 0; i < n && !repeat; ++i)
+            repeat = strncmp(seen[i], l, sizeof seen[i] - 1) == 0;
+        if (repeat) break;
+        safe_copy(seen[n], sizeof seen[n], l);
+        visit(seen[n], ctx);
+        ++n;
+        cycle(&s_cycle_probe);
+    }
+    return n;
+}
+
 const char* launcher_model_supersampling_label(const LauncherModel* m) {
     /* Settings SSAA: offline full SW/GL path; netplay dual-raster uses this
      * for OpenGL present quality while SW authority stays 1×. */
@@ -2098,11 +2315,33 @@ const char* launcher_model_aa_label(const LauncherModel* m) {
     }
 }
 
+/* Index of the current value in the host's texture-filter catalog, or -1. */
+static int texture_filter_index(const LauncherModel* m, int value) {
+    for (int i = 0; m->texture_filter_values && i < m->num_texture_filters; ++i)
+        if (m->texture_filter_values[i] == value) return i;
+    return -1;
+}
+
+int launcher_model_normalize_texture_filter(const LauncherModel* m, int value) {
+    if (m && m->num_texture_filters > 0)   /* host vocabulary: keep any value it offers */
+        return texture_filter_index(m, value) >= 0 ? value : m->texture_filter_values[0];
+    return value ? 1 : 0;                 /* legacy Nearest/Bilinear */
+}
+
 void launcher_model_toggle_texture_filter(LauncherModel* m) {
+    if (m->num_texture_filters > 0) {
+        const int i = texture_filter_index(m, m->s.texture_filter);
+        m->s.texture_filter = m->texture_filter_values[(i + 1) % m->num_texture_filters];
+        return;
+    }
     m->s.texture_filter = !m->s.texture_filter;
 }
 
 const char* launcher_model_texture_filter_label(const LauncherModel* m) {
+    if (m->num_texture_filters > 0 && m->texture_filter_labels) {
+        const int i = texture_filter_index(m, m->s.texture_filter);
+        return m->texture_filter_labels[i >= 0 ? i : 0];
+    }
     return m->s.texture_filter ? "Bilinear" : "Nearest";
 }
 
@@ -2137,25 +2376,6 @@ void launcher_model_clear_shader_path(LauncherModel* m) {
     launcher_model_set_shader_path(m, "");
 }
 
-void launcher_model_toggle_geometry_correction(LauncherModel* m) {
-    m->s.geometry_correction = !m->s.geometry_correction;
-}
-
-void launcher_model_toggle_perspective_texturing(LauncherModel* m) {
-    m->s.perspective_texturing = !m->s.perspective_texturing;
-}
-
-/* Sub-pixel vertices are only observable in the supersampled mirror: at 1x the
- * corrected position rounds back to the pixel it came from. Say so in the UI
- * rather than letting the row look broken when someone ticks it at native res. */
-bool launcher_model_geometry_correction_inert(const LauncherModel* m) {
-    /* With an internal-resolution vocabulary the native entry is value 1
-     * (the documented convention); the legacy cycle keeps its 1x test. */
-    if (launcher_model_internal_resolution_offered(m))
-        return m->s.geometry_correction && m->s.internal_resolution == 1;
-    return m->s.geometry_correction && m->s.supersampling < 2;
-}
-
 // Screen-model vocabulary: the active SystemProfile's own set when it has one
 // (e.g. GBA's 5 LCD models), else the legacy 4-entry PSX-era set above.
 static const char* const* screen_kind_vocab(const LauncherModel* m, int* out_n) {
@@ -2171,6 +2391,16 @@ static const char* const* screen_kind_vocab(const LauncherModel* m, int* out_n) 
 void launcher_model_cycle_screen_kind(LauncherModel* m) {
     int n = 4; (void)screen_kind_vocab(m, &n);
     m->s.screen_kind = (clampi(m->s.screen_kind, 0, n - 1) + 1) % n;
+}
+int launcher_model_screen_kind_count(const LauncherModel* m) {
+    int n=0;(void)screen_kind_vocab(m,&n);return n;
+}
+const char* launcher_model_screen_kind_name(const LauncherModel* m,int index) {
+    int n=0;const char* const* names=screen_kind_vocab(m,&n);
+    return names[clampi(index,0,n-1)];
+}
+void launcher_model_set_screen_kind(LauncherModel* m,int index) {
+    if(m && m->has_screen_kind)m->s.screen_kind=clampi(index,0,launcher_model_screen_kind_count(m)-1);
 }
 
 const char* launcher_model_screen_kind_label(const LauncherModel* m) {
@@ -2466,7 +2696,7 @@ static void lm_persist_cart_rom(const LauncherModel* m) {
     if (m->setup_wizard_supported || m->num_discs > 1 ||
         (m->profile && m->profile->verify.mode == 1) ||
         !lm_path_readable(m->rom_full)) return;
-    if ((m->has_expected_crc || m->num_known_sha256 || m->num_known_sha1) &&
+    if (launcher_model_rom_has_fingerprint(m) &&
         !launcher_model_rom_verified(m)) return;
 #if defined(_WIN32)
     DWORD n = GetFullPathNameA(m->rom_full, (DWORD)sizeof(absolute), absolute, NULL);
@@ -3011,6 +3241,13 @@ bool launcher_model_can_finish_setup(const LauncherModel* m) {
     return true;
 }
 
+bool launcher_model_can_open_mods(const LauncherModel* m) {
+    if (!m || m->profile_handoff || m->setup_preparing) return false;
+    if (m->profile && m->profile->verify.mode == 1)
+        return m->rom_present && m->rom_full[0] && m->verify.verdict == 1;
+    return true; /* Preserve non-disc hosts. */
+}
+
 bool launcher_model_can_launch(const LauncherModel* m) {
     if (!m) return false;
     if (!m->rom_present || strcmp(m->rom_size, "--") == 0) return false;
@@ -3020,9 +3257,8 @@ bool launcher_model_can_launch(const LauncherModel* m) {
         /* Disc systems: reject none/bad; warn (2) and ok (1) are playable. */
         if (m->verify.verdict == 0 || m->verify.verdict == 3) return false;
     } else {
-        const int has_fp = m->has_expected_crc || m->num_known_sha256 > 0 ||
-                           m->num_known_sha1 > 0;
-        if (has_fp && !launcher_model_rom_verified(m)) return false;
+        if (launcher_model_rom_has_fingerprint(m) &&
+            !launcher_model_rom_verified(m)) return false;
     }
     if (m->has_bios && !m->setup_bios_ok) return false;
     if (m->setup_preparing) return false;
@@ -4486,7 +4722,7 @@ void launcher_model_map_all_advance(LauncherModel* m) {
 }
 void launcher_model_begin_assist_capture(LauncherModel* m, int action,
                                          bool gamepad) {
-    if (!m->settings_bindings || action < 0 ||
+    if (!m || action < 0 ||
         action >= m->assist_binding_count)
         return;
     m->hk_capturing = false;
@@ -4540,7 +4776,7 @@ void launcher_model_reset_player_bindings(LauncherModel* m, int player) {
            sizeof m->s.player_pad_bind[player]);
 }
 void launcher_model_reset_assist_bindings(LauncherModel* m) {
-    if (!m || !m->settings_bindings) return;
+    if (!m) return;
     memcpy(m->s.assist_key_bind, m->default_assist_key_bind,
            sizeof m->s.assist_key_bind);
     memcpy(m->s.assist_pad_bind, m->default_assist_pad_bind,
@@ -4637,7 +4873,7 @@ const char* launcher_model_relay_error_text(const char* err, bool ice_mode) {
                "press Play again.";
     if (strcmp(err, "host_relay_spectators") == 0)
         return "A match carried by the host can't include spectators. "
-               "Remove them, or turn off \"Host carries the match\".";
+               "Remove them and press Play again.";
     if (strcmp(err, "relay_unavailable") == 0) {
         if (ice_mode)
             return "Couldn't start through the host. A guest has no "

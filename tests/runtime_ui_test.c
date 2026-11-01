@@ -60,6 +60,19 @@ static int run_action(void *context, const RecompRuntimeUiItem *item) {
     return 1;
 }
 
+/* Nested pages: one int per row key, indexed by the key's first letter. */
+static int nested_values[26];
+static int nested_get(void *context, const RecompRuntimeUiItem *item, int *out) {
+    (void)context;
+    *out = nested_values[item->key[0] - 'a'];
+    return 1;
+}
+static int nested_set(void *context, const RecompRuntimeUiItem *item, int value) {
+    (void)context;
+    nested_values[item->key[0] - 'a'] = value;
+    return 1;
+}
+
 static void save(void *context) { ++((TestState *)context)->save_count; }
 static void visible(void *context, int open) {
     ((TestState *)context)->visible = open;
@@ -297,6 +310,113 @@ int main(void) {
         recomp_runtime_ui_render_argb8888(t, pic, 256, 240, 256 * 4);
         assert(memcmp(pic, ref, sizeof(pic)));
         recomp_runtime_ui_destroy(t);
+    }
+    /* Nested pages: a '/'-separated section is a path. Its first component is
+     * the top-level section; deeper components become folder rows, placed at
+     * their first item. Accept opens a folder, Back climbs one level and puts
+     * the cursor back on the folder, left/right on a folder do nothing, and a
+     * flat section is unchanged. */
+    {
+        static const RecompRuntimeUiItem tree[] = {
+            { "a", "Mods/One", "A", NULL, RECOMP_RUNTIME_UI_BOOL, 0, 1, 1, NULL, 0, NULL },
+            { "b", "Mods/One/Deep", "B", NULL, RECOMP_RUNTIME_UI_BOOL, 0, 1, 1, NULL, 0, NULL },
+            { "c", "Mods/Two", "C", NULL, RECOMP_RUNTIME_UI_BOOL, 0, 1, 1, NULL, 0, NULL },
+            { "d", "Mods/One", "D", NULL, RECOMP_RUNTIME_UI_BOOL, 0, 1, 1, NULL, 0, NULL },
+            { "flat", "Video", "Flat", NULL, RECOMP_RUNTIME_UI_BOOL, 0, 1, 1, NULL, 0, NULL },
+            /* Malformed paths are left out: no extra rows, sections or folders. */
+            { "x", "Mods/One/", "X", NULL, RECOMP_RUNTIME_UI_BOOL, 0, 1, 1, NULL, 0, NULL },
+            { "y", "Mods//Y", "Y", NULL, RECOMP_RUNTIME_UI_BOOL, 0, 1, 1, NULL, 0, NULL },
+            { "z", "/Z", "Z", NULL, RECOMP_RUNTIME_UI_BOOL, 0, 1, 1, NULL, 0, NULL },
+        };
+        static uint32_t pic[256 * 224];
+        RecompRuntimeUiConfig nested = {0};
+        nested.title = "Nested";
+        nested.items = tree;
+        nested.item_count = sizeof(tree) / sizeof(tree[0]);
+        nested.callbacks.get_value = nested_get;
+        nested.callbacks.set_value = nested_set;
+        RecompRuntimeUi *n = recomp_runtime_ui_create(&nested);
+        assert(n != NULL);
+        recomp_runtime_ui_open(n);
+        press(n, RECOMP_RUNTIME_UI_INPUT_ACCEPT);   /* Mods: folders One, Two */
+        press(n, RECOMP_RUNTIME_UI_INPUT_RIGHT);    /* on a folder: no effect */
+        press(n, RECOMP_RUNTIME_UI_INPUT_ACCEPT);   /* One: A, Deep, D */
+        press(n, RECOMP_RUNTIME_UI_INPUT_ACCEPT);   /* A */
+        assert(nested_values['a' - 'a'] == 1);
+        press(n, RECOMP_RUNTIME_UI_INPUT_DOWN);
+        press(n, RECOMP_RUNTIME_UI_INPUT_ACCEPT);   /* into Deep */
+        recomp_runtime_ui_render_argb8888(n, pic, 256, 224, 256 * 4);
+        press(n, RECOMP_RUNTIME_UI_INPUT_ACCEPT);   /* B */
+        assert(nested_values['b' - 'a'] == 1);
+        press(n, RECOMP_RUNTIME_UI_INPUT_BACK);     /* back on the Deep row */
+        press(n, RECOMP_RUNTIME_UI_INPUT_DOWN);
+        press(n, RECOMP_RUNTIME_UI_INPUT_ACCEPT);   /* D */
+        assert(nested_values['d' - 'a'] == 1);
+        press(n, RECOMP_RUNTIME_UI_INPUT_BACK);     /* back on the One row */
+        press(n, RECOMP_RUNTIME_UI_INPUT_DOWN);
+        press(n, RECOMP_RUNTIME_UI_INPUT_ACCEPT);   /* into Two */
+        press(n, RECOMP_RUNTIME_UI_INPUT_ACCEPT);   /* C */
+        assert(nested_values['c' - 'a'] == 1);
+        press(n, RECOMP_RUNTIME_UI_INPUT_BACK);     /* Mods */
+        press(n, RECOMP_RUNTIME_UI_INPUT_BACK);     /* top level */
+        press(n, RECOMP_RUNTIME_UI_INPUT_DOWN);
+        press(n, RECOMP_RUNTIME_UI_INPUT_ACCEPT);   /* Video, a flat section */
+        press(n, RECOMP_RUNTIME_UI_INPUT_ACCEPT);
+        assert(nested_values['f' - 'a'] == 1);
+        assert(nested_values['b' - 'a'] == 1 && nested_values['c' - 'a'] == 1);
+        press(n, RECOMP_RUNTIME_UI_INPUT_BACK);     /* section list, on Video */
+        press(n, RECOMP_RUNTIME_UI_INPUT_DOWN);     /* only Mods and Video exist, */
+        press(n, RECOMP_RUNTIME_UI_INPUT_ACCEPT);   /* so this wraps to Mods */
+        press(n, RECOMP_RUNTIME_UI_INPUT_UP);       /* rows One, Two: wraps to Two */
+        press(n, RECOMP_RUNTIME_UI_INPUT_ACCEPT);   /* (no third, unnamed folder) */
+        press(n, RECOMP_RUNTIME_UI_INPUT_ACCEPT);   /* C */
+        assert(nested_values['c' - 'a'] == 0);
+        assert(nested_values['x' - 'a'] == 0 && nested_values['y' - 'a'] == 0 &&
+               nested_values['z' - 'a'] == 0);
+        press(n, RECOMP_RUNTIME_UI_INPUT_BACK);     /* Mods */
+        press(n, RECOMP_RUNTIME_UI_INPUT_BACK);     /* section list */
+        press(n, RECOMP_RUNTIME_UI_INPUT_BACK);     /* closes the menu */
+        assert(!recomp_runtime_ui_is_open(n));
+        /* Reopening returns to the section list (the selected section is
+         * remembered, as before), never into a sub-page left open. */
+        recomp_runtime_ui_open(n);
+        press(n, RECOMP_RUNTIME_UI_INPUT_ACCEPT);   /* Mods (remembered): One, Two */
+        press(n, RECOMP_RUNTIME_UI_INPUT_ACCEPT);   /* One */
+        press(n, RECOMP_RUNTIME_UI_INPUT_ACCEPT);   /* A, the first row */
+        assert(nested_values['a' - 'a'] == 0);
+        recomp_runtime_ui_destroy(n);
+    }
+
+    /* Display truncation must not change a folder's path identity, including
+     * two siblings whose first 95 characters are identical. */
+    {
+        char first[102] = "Mods/", second[102] = "Mods/";
+        memset(first + 5, 'X', 96);
+        memset(second + 5, 'X', 96);
+        first[100] = 'A'; second[100] = 'B';
+        first[101] = '\0'; second[101] = '\0';
+        RecompRuntimeUiItem rows[] = {
+            { "g", first, "First", NULL, RECOMP_RUNTIME_UI_BOOL, 0, 1, 1, NULL, 0, NULL },
+            { "h", second, "Second", NULL, RECOMP_RUNTIME_UI_BOOL, 0, 1, 1, NULL, 0, NULL },
+        };
+        RecompRuntimeUiConfig long_names = {0};
+        long_names.items = rows;
+        long_names.item_count = 2;
+        long_names.callbacks.get_value = nested_get;
+        long_names.callbacks.set_value = nested_set;
+        RecompRuntimeUi *n = recomp_runtime_ui_create(&long_names);
+        assert(n != NULL);
+        recomp_runtime_ui_open(n);
+        press(n, RECOMP_RUNTIME_UI_INPUT_ACCEPT);
+        press(n, RECOMP_RUNTIME_UI_INPUT_ACCEPT);
+        press(n, RECOMP_RUNTIME_UI_INPUT_ACCEPT);
+        assert(nested_values['g' - 'a'] == 1 && nested_values['h' - 'a'] == 0);
+        press(n, RECOMP_RUNTIME_UI_INPUT_BACK);
+        press(n, RECOMP_RUNTIME_UI_INPUT_DOWN);
+        press(n, RECOMP_RUNTIME_UI_INPUT_ACCEPT);
+        press(n, RECOMP_RUNTIME_UI_INPUT_ACCEPT);
+        assert(nested_values['g' - 'a'] == 1 && nested_values['h' - 'a'] == 1);
+        recomp_runtime_ui_destroy(n);
     }
     puts("runtime UI tests passed");
     return 0;

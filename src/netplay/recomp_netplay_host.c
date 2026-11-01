@@ -10,11 +10,18 @@
  * session slot 0 under RECOMP_NETPLAY_SLOTS_HOST_FIRST).
  */
 #include "recomp_netplay_host.h"
+#include "recomp_netplay_account.h"
 
 #include "recomp_net/auth.h"
 #include "recomp_net/lan_lobby.h"
 #include "recomp_net/lan_direct.h"
 #include "recomp_net/lan_beacon.h"
+#if defined(__has_include)
+#  if __has_include("recomp_net/lan_room.h")
+#    include "recomp_net/lan_room.h"
+#    define RUI_HAVE_LAN_ROOM 1
+#  endif
+#endif
 #include "recomp_net/chat_filter.h"
 #include "recomp_net/address.h"
 #include "recomp_net/host_relay.h"
@@ -45,6 +52,11 @@ static RecompNetplayHostHooks g_h;
 /* g_h.mods, for brevity: NULL is a vanilla-only build. */
 static const RecompNetplayModHooks *g_mods;
 static int g_inited;
+#if defined(RUI_HAVE_LAN_ROOM)
+static int room4_active(void);
+static int room4_leave(void);
+static void room4_rematch(void);
+#endif
 static int g_hosting_lan;
 static int g_joined_lan;
 static int g_joined_direct; /* UDP Direct IP (remote); not file-registry */
@@ -659,7 +671,7 @@ static RNetLobbyMatchCaps default_caps(const RecompLauncherCSettings *settings)
   caps.input_prediction = clamp_input_prediction(caps.input_prediction);
   caps.force_turn = g_lobby_force_turn ? 1 : 0;
   caps.force_input_relay = g_lobby_force_input_relay ? 1 : 0;
-  /* Host relay (docs/HOST_NETPLAY.md): the host's setting, default off. The
+  /* Host relay (docs/HOST_NETPLAY.md): always asked for online. The
    * lobby client drives the port / probe / reports from this cap once the
    * server echoes it back to the room. */
   caps.relay_host = rnet_lobby_relay_host_pref() ? 1 : 0;
@@ -1167,6 +1179,10 @@ int recomp_netplay_host_init(const RecompNetplayHostHooks *hooks)
     return -1;
   memset(&g_h, 0, sizeof(g_h));
   g_h = *hooks;
+  if(g_h.lan_max_players && (g_h.lan_max_players<2 || g_h.lan_max_players>4))return -1;
+#if !defined(RUI_HAVE_LAN_ROOM)
+  if(g_h.lan_max_players)return -1;
+#endif
   g_session_variant = g_h.default_session_variant;
   if (!supports_session_variant(g_session_variant)) return -1;
 #ifndef RNET_HAS_SESSION_VARIANT
@@ -1192,9 +1208,13 @@ int recomp_netplay_host_init(const RecompNetplayHostHooks *hooks)
   g_local_address_count = 0;
   g_lobby_rollback = 1;
   g_lobby_input_prediction = 0;
-  /* ICE is the online default; the host relay is opt-in (recomp-net's own
-   * default is on). The launcher pushes a saved opt-in after init. */
-  rnet_lobby_set_relay_host_pref(0);
+  /* Online, the host carries the match over ICE and nobody forwards a port;
+   * it is not a setting. LAN / Direct IP rooms are host-carried anyway and
+   * never publish these caps. */
+  rnet_lobby_set_relay_host_pref(1);
+#ifdef RUI_HAVE_ICE_HUB
+  rnet_lobby_set_relay_via_ice(1);
+#endif
 
   /* The lobby client learns what this build is before it can say anything:
    * title and pin for every op, the seat ceiling for create, the platform
@@ -1227,7 +1247,7 @@ int recomp_netplay_host_init(const RecompNetplayHostHooks *hooks)
             g_mods ? "the mod runtime supplied no transfer hooks"
                    : "built without mod support");
   }
-  if (title_max_players() > 2)
+  if (title_max_players() > 2 && !g_h.lan_max_players)
     fprintf(stderr, "netplay: %d-player rooms online; LAN / Direct IP rooms "
                     "are two seats in this build\n", title_max_players());
   g_inited = 1;
@@ -1243,6 +1263,9 @@ void recomp_netplay_host_shutdown(void)
 
 void recomp_netplay_host_prepare_rematch(void)
 {
+#if defined(RUI_HAVE_LAN_ROOM)
+  if(room4_active()){room4_rematch();return;}
+#endif
   g_lan_start_seen = 0;
   if (g_hosting_lan || g_joined_lan) {
     g_lan_room.started = 0;
@@ -1290,6 +1313,9 @@ void recomp_netplay_host_begin_soft_return(RecompLauncherCGameInfo *gi,
 int recomp_netplay_host_leave(void)
 {
   int rc;
+#if defined(RUI_HAVE_LAN_ROOM)
+  if(room4_active())room4_leave();
+#endif
   if (g_hosting_lan) {
     (void)rnet_lan_direct_host_notify_close(g_direct_host);
     close_direct_sockets();
@@ -1328,6 +1354,9 @@ const char *recomp_netplay_host_resume_endpoint(void)
 
 int recomp_netplay_host_in_lan(void)
 {
+#if defined(RUI_HAVE_LAN_ROOM)
+  if(room4_active())return 1;
+#endif
   return g_hosting_lan || g_joined_lan;
 }
 
@@ -1386,26 +1415,8 @@ static void cb_pump(void *ctx)
    * Re-init only when the URL actually changes rather than every pump: the
    * worker thread reads g.host while a login is in flight, and memset-ing it
    * under that read 60 times a second would be a data race for no gain. */
-  {
-    static char auth_url[256];
-    const char *url = cb_default_url(NULL);
-    if (url && url[0] && strcmp(url, auth_url) != 0) {
-      /* Anchor the secret to the EXECUTABLE directory before the first init.
-       * Its default is the bare relative name "netplay_secret", resolved
-       * against the working directory -- so the same install signed itself
-       * out depending on where it was launched from, and a rebuild run from a
-       * different directory read as a lost login. rnet_auth.c migrates an old
-       * CWD-relative file into this path on first load, so nobody is signed
-       * out by the move. */
-      char secret_path[512];
-      if (g_h.exe_dir_path &&
-          g_h.exe_dir_path(g_h.ctx, "netplay_secret", secret_path,
-                           sizeof(secret_path)))
-        rnet_account_set_secret_path(secret_path);
-      snprintf(auth_url, sizeof(auth_url), "%s", url);
-      rnet_account_init(url);
-    }
-  }
+  recomp_netplay_account_sync(cb_default_url(NULL), g_h.exe_dir_path,
+                             g_h.ctx);
   rnet_account_pump();
 
   /* Publish the account name to the lobby.
@@ -1628,6 +1639,21 @@ static int cb_list_get(void *ctx, int index, RecompLauncherCNetplayLobby *out)
   out->allow_spectators = row.allow_spectators;
   out->max_spectators = row.max_spectators;
   out->spectator_count = row.spectator_count;
+#if defined(RNET_LOBBY_HAS_LIST_DIRECT_LATENCY)
+  /* A direct probe to the host, timed when the list was opened or
+   * refreshed; until it lands (or where it cannot link) the estimate through
+   * the lobby server, marked so the row draws "~". -1 ("—") when neither. */
+  {
+    int direct = 0;
+    out->latency_ms = rnet_lobby_list_latency_ms(index, &direct);
+    out->latency_is_estimate = out->latency_ms >= 0 && !direct;
+  }
+#elif defined(RNET_LOBBY_HAS_LIST_LATENCY)
+  out->latency_ms = rnet_lobby_list_latency_estimate_ms(index);
+  out->latency_is_estimate = out->latency_ms >= 0;
+#else
+  out->latency_ms = -1;
+#endif
   return 1;
 }
 
@@ -3928,8 +3954,14 @@ static RecompLauncherCNetplayCallbacks g_callbacks = {
 #endif
 };
 
+#if defined(RUI_HAVE_LAN_ROOM)
+#include "recomp_netplay_lan_room.inc"
+#endif
 const RecompLauncherCNetplayCallbacks *recomp_netplay_host_callbacks(void)
 {
+#if defined(RUI_HAVE_LAN_ROOM)
+  if(g_inited && g_h.lan_max_players)return room4_callbacks();
+#endif
   return g_inited ? &g_callbacks : NULL;
 }
 

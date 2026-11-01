@@ -102,6 +102,24 @@ Selection is the model's alone: the ImGui window takes no keyboard/gamepad
 navigation of its own (`ImGuiWindowFlags_NoNavInputs`, except while a text row
 is edited), or Enter / A would also activate the row under ImGui's own cursor.
 
+### Host-drawn presentations
+
+A host that has to draw the menu in its own style -- a panel built into a
+game's own pause screen, a toolkit other than ImGui -- reads the model through
+`recomp_runtime_ui_view_row_count`, `_view_selected_row` and `_view_row`
+instead of duplicating it. A row view carries the item (NULL for a section or
+folder row), its label, its value formatted exactly as the built-in
+presentations format it, and whether it is enabled. Input still goes through
+`recomp_runtime_ui_handle_input`, so navigation, choice stepping, actions and
+the `save` callback behave the same in every presentation.
+
+`recomp_runtime_ui_open_section(ui, name)` opens straight onto one section's
+page, for a one-page menu with no section list. Set
+`RecompRuntimeUiConfig.navigation_flags` to
+`RECOMP_RUNTIME_UI_NAVIGATION_SKIP_DISABLED` when a disabled row should be
+shown but never take the selection; zero keeps the default, where every row
+can.
+
 ## What “every recomp-ui game” requires
 
 Consuming recomp-ui is the anchor, but updating the git submodule alone cannot
@@ -135,3 +153,35 @@ the system id selects design tokens only.
 - Prefer UTF-8-capable modern presentation; the compact fallback is ASCII-only.
 - A renderer/backend switch that cannot be applied live should remain in the
   pre-boot launcher until the host provides a safe restart workflow.
+
+## psxrecomp in-game menu provider
+
+`src/consoles/psx/psx_menu_provider.cpp` (model wiring) and
+`psx_menu_provider_imgui.cpp` (SDL input, ImGui presentation) implement
+psxrecomp's `PsxMenuProvider` contract (`runtime/include/psx_menu_host.h`, owned
+by psxrecomp) with this runtime-UI model. The runtime keeps every policy --
+pause (refused in netplay), live settings and their restart rules, mod changes,
+the disc tray, and exits (quit, return to the launcher, quick relaunch) -- and
+offers it through `PsxMenuHost`; the provider only shows values the host
+reports and sends edits back to it, so recomp-ui and any other provider behave
+the same.
+
+- Rows: Display > Fullscreen; Graphics > Render thread (restart-only: a quick
+  relaunch when the menu closes); System > Resume, Pause in menu, Return to
+  launcher, Quit; Disc > Selected disc, Insert disc and resume (multi-disc
+  titles, through the runtime's tray policy). Linear, FMV and texture
+  filtering and the internal resolution are not rows: psxrecomp's Image
+  Filtering and Internal Resolution mods own them, with the CRT Filter,
+  Enhanced Audio and Rewind mods (the Mods page; SETTINGS_STANDARD.md).
+- Opens with F10 or Ctrl+L, or Select + L3; arrows / Enter / Esc or D-pad /
+  Cross / Circle navigate. Each opening starts at the first section.
+- Selection: psxrecomp uses it when the title registers no provider, so
+  recomp-ui stays the default. Chosen that way
+  (`PsxMenuHost.default_selection`) it attaches only for multi-disc titles,
+  where recomp-ui's game menu already appears; a title that wants it for every
+  game registers it with `psx_menu_set_provider(recomp_ui_psx_menu_provider())`.
+- Built only inside a psxrecomp build (the runtime include path has
+  `psx_menu_host.h`); standalone recomp-ui builds compile it to nothing. No API
+  of recomp-ui changes.
+- Test: `recomp-ui-psx-menu-provider` (needs `-DRECOMP_UI_PSXRECOMP_ROOT=` a
+  psxrecomp checkout, or one next to this repo).

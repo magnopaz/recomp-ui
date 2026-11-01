@@ -65,24 +65,50 @@ void draw_sections(RecompRuntimeUi *ui, const LauncherTheme &theme,
     for (size_t index = 0; index < ui->section_count; ++index) {
         ImGui::PushID(static_cast<int>(index));
         const bool selected = index == ui->section_index;
-        if (ImGui::Selectable(ui->sections[index], selected, 0,
-                              ImVec2(0.0f, theme.row_height))) {
-            ui->section_index = index;
-            if (enter_on_click) recomp_runtime_ui_enter_section(ui, index);
+        const bool clicked = ImGui::Selectable(ui->sections[index], selected, 0,
+                                               ImVec2(0.0f, theme.row_height));
+        if ((clicked || ImGui::IsItemHovered()) &&
+            (index != ui->section_index || (clicked && enter_on_click))) {
+            const int was_in_section = ui->in_section;
+            recomp_runtime_ui_enter_section(ui, index);
+            if (!(clicked && enter_on_click)) ui->in_section = was_in_section;
         }
-        if (ImGui::IsItemHovered()) ui->section_index = index;
         ImGui::PopID();
     }
 }
 
 void draw_items(RecompRuntimeUi *ui, const LauncherTheme &theme,
                 bool touch_friendly) {
-    const size_t count = recomp_runtime_ui_section_item_count(
-        ui, ui->section_index);
+    const size_t count = recomp_runtime_ui_page_entry_count(ui);
     for (size_t index = 0; index < count; ++index) {
-        const RecompRuntimeUiItem *item = recomp_runtime_ui_section_item(
-            ui, ui->section_index, index);
-        if (!item) continue;
+        char folder[96];
+        const RecompRuntimeUiItem *item = recomp_runtime_ui_page_entry(
+            ui, index, folder, sizeof(folder));
+        if (!item) {
+            /* Folder row: opens a nested page. */
+            if (!folder[0]) continue;
+            ImGui::PushID(static_cast<int>(index));
+            const bool selected = ui->in_section && index == ui->row_index;
+            char label[112];
+            std::snprintf(label, sizeof(label), "%s  >", folder);
+            if (ImGui::Selectable(label, selected, 0,
+                                  ImVec2(0.0f, theme.row_height))) {
+                ui->row_index = index;
+                ui->in_section = 1;
+                if (recomp_runtime_ui_enter_folder(ui, index)) {
+                    /* The remaining rows and hover belong to the parent page.
+                     * Draw the new page on the next frame. */
+                    ImGui::PopID();
+                    return;
+                }
+            }
+            if (ImGui::IsItemHovered()) {
+                ui->row_index = index;
+                ui->in_section = 1;
+            }
+            ImGui::PopID();
+            continue;
+        }
 
         const bool enabled = recomp_runtime_ui_item_enabled(ui, item) != 0;
         const bool selected = ui->in_section && index == ui->row_index;
@@ -364,10 +390,29 @@ extern "C" void recomp_runtime_ui_render_imgui(RecompRuntimeUi *ui) {
         const float close_h = touch_friendly
             ? std::max(ImGui::GetFrameHeight(), theme.row_height * 0.82f)
             : 0.0f;
-        const float footer_h = touch_friendly
-            ? close_h + theme.spacing_sm * 2.0f
-            : ImGui::GetTextLineHeightWithSpacing() + theme.spacing_lg + 2.0f;
-        const float content_h = ImGui::GetContentRegionAvail().y - footer_h;
+        const char *close_label = "Resume";
+        const float available_w = ImGui::GetContentRegionAvail().x;
+        const float wanted_close_w = touch_friendly
+            ? std::max(320.0f, ImGui::CalcTextSize(close_label).x + theme.spacing_lg * 2.0f)
+            : ImGui::CalcTextSize(close_label).x + theme.spacing_lg * 2.0f;
+        const float close_w = std::min(wanted_close_w, available_w * 0.4f);
+        const float text_w = std::max(1.0f, available_w - close_w - ImGui::GetStyle().ItemSpacing.x);
+        char hint[384];
+        if (touch_friendly) {
+            std::snprintf(hint, sizeof hint, "Tap a section or setting");
+        } else {
+            std::snprintf(hint, sizeof hint, "%s  Select    %s  Back    D-pad / Arrows  Navigate",
+                ui->config.accept_label ? ui->config.accept_label : "Select",
+                ui->config.back_label ? ui->config.back_label : "Back");
+        }
+        float text_h = ImGui::CalcTextSize(hint, nullptr, false, text_w).y;
+        if (ui->status_frames)
+            text_h += ImGui::GetStyle().ItemSpacing.y +
+                      ImGui::CalcTextSize(ui->status, nullptr, false, text_w).y;
+        const float footer_content_h = std::max(text_h,
+            touch_friendly ? close_h : ImGui::GetFrameHeight());
+        const float footer_h = footer_content_h + theme.spacing_lg + 2.0f;
+        const float content_h = std::max(1.0f, ImGui::GetContentRegionAvail().y - footer_h);
         if (wide) {
             const float sidebar_w = touch_friendly
                 ? std::clamp(width * 0.20f, 280.0f, 520.0f)
@@ -377,8 +422,14 @@ extern "C" void recomp_runtime_ui_render_imgui(RecompRuntimeUi *ui) {
             ImGui::EndChild();
             ImGui::SameLine();
             ImGui::BeginChild("##items", ImVec2(0.0f, content_h), true);
+            char page_title[256];
+            recomp_runtime_ui_page_title(ui, page_title, sizeof(page_title));
+            if (ui->page[0]) {
+                if (ImGui::SmallButton("< Back")) recomp_runtime_ui_leave_folder(ui);
+                ImGui::SameLine();
+            }
             ImGui::PushStyleColor(ImGuiCol_Text, col(theme.accent2));
-            ImGui::TextUnformatted(ui->sections[ui->section_index]);
+            ImGui::TextUnformatted(page_title);
             ImGui::PopStyleColor();
             ImGui::Separator();
             draw_items(ui, theme, touch_friendly);
@@ -386,10 +437,13 @@ extern "C" void recomp_runtime_ui_render_imgui(RecompRuntimeUi *ui) {
         } else {
             ImGui::BeginChild("##content", ImVec2(0.0f, content_h), true);
             if (ui->in_section) {
-                if (ImGui::SmallButton("< Back"))
+                if (ImGui::SmallButton("< Back") &&
+                    !recomp_runtime_ui_leave_folder(ui))
                     recomp_runtime_ui_leave_section(ui);
                 ImGui::SameLine();
-                ImGui::TextUnformatted(ui->sections[ui->section_index]);
+                char page_title[256];
+                recomp_runtime_ui_page_title(ui, page_title, sizeof(page_title));
+                ImGui::TextUnformatted(page_title);
                 ImGui::Separator();
                 draw_items(ui, theme, touch_friendly);
             } else {
@@ -399,32 +453,20 @@ extern "C" void recomp_runtime_ui_render_imgui(RecompRuntimeUi *ui) {
         }
 
         ImGui::Separator();
-        if (touch_friendly) {
-            ImGui::TextDisabled("Tap a section or setting");
-        } else {
-            const char *accept = ui->config.accept_label
-                                     ? ui->config.accept_label : "Select";
-            const char *back = ui->config.back_label
-                                   ? ui->config.back_label : "Back";
-            ImGui::TextDisabled(
-                "%s  Select    %s  Back    D-pad / Arrows  Navigate",
-                accept, back);
-        }
+        // Text owns its own wrapping region; it cannot run behind Resume.
+        ImGui::BeginChild("##footer", ImVec2(text_w, footer_content_h), false,
+                          ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+        ImGui::PushTextWrapPos(0.0f);
+        ImGui::TextDisabled("%s", hint);
         if (ui->status_frames) {
-            ImGui::SameLine();
             ImGui::PushStyleColor(ImGuiCol_Text, col(theme.accent2));
             ImGui::TextUnformatted(ui->status);
             ImGui::PopStyleColor();
-            --ui->status_frames;
+            recomp_runtime_ui_advance_status(ui, ImGui::GetIO().DeltaTime * 60.0f);
         }
+        ImGui::PopTextWrapPos();
+        ImGui::EndChild();
         ImGui::SameLine();
-        const char *close_label = "Resume";
-        const float close_w = touch_friendly
-            ? std::max(320.0f, ImGui::CalcTextSize(close_label).x +
-                                   theme.spacing_lg * 2.0f)
-            : ImGui::CalcTextSize(close_label).x + theme.spacing_lg * 2.0f;
-        ImGui::SetCursorPosX(ImGui::GetWindowWidth() -
-                             ImGui::GetStyle().WindowPadding.x - close_w);
         if (ImGui::Button(close_label, ImVec2(close_w, close_h)))
             recomp_runtime_ui_close(ui);
     }

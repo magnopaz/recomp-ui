@@ -121,6 +121,31 @@ int rc = recomp_launcher_run_window("My Game — Launcher", &io, &gi,
 #endif
 ```
 
+#### Telling players which ROM they picked
+
+A bare fingerprint can only say "ROM not recognized". List the dumps players
+actually confuse with yours in `gi.rom_revisions` and the launcher names them:
+
+```c
+static const RecompLauncherCRomRevision kRevisions[] = {
+    /* label, sha256, sha1, crc32, supported, note */
+    {"My Game (USA) (Rev 1)", "b8f7...", NULL, NULL, 1, NULL},
+    {"My Game (USA)", NULL, "449a...", "1033EBA4", 0,
+     "This is the original release; this build needs Rev 1."},
+};
+gi.rom_revisions = kRevisions; gi.num_rom_revisions = 2;
+gi.rom_help = "Headered (.smc) and headerless (.sfc) dumps both work.";
+```
+
+Digests cover the image after any copier/iNES header. A supported entry
+verifies the ROM (alongside `expected_crc` / `known_sha256` / `known_sha1_hex`);
+any other match shows "Wrong ROM: This is My Game (USA). My Game needs My Game
+(USA) (Rev 1) (SHA-256 ...)". A file nothing matches shows an optional
+`gi.rom_describe` host probe's description (e.g. the internal header's title
+and version) and the requirement. ZIP/7z/RAR/gzip archives and
+unreadable files get their own message, and **Copy details** puts the file's
+SHA-256/SHA-1/CRC32 and the requirement on the clipboard for bug reports.
+
 For the SNES profile, this entry point loads launcher preferences from
 `gi.config_path` (default `config.ini`) and saves edited settings on **Play,
 Quit, and Relaunch**. A host that ignores `io` on Quit therefore no longer
@@ -328,6 +353,16 @@ in-session commits keep their existing paths; commit-only hosts never
 auto-prepare. A host can prime a validated warm ticket before opening the UI
 so an ordinary warm launcher does not need a preparation screen at all.
 
+When `RECOMP_LAUNCHER_HAS_MOD_PREPARATION_PROGRESS` is defined, a worker-safe
+provider may also supply `commit_with_progress`. It receives a report callback
+and context; pass a fraction in 0..1 (or a negative value for an indefinite bar)
+and a short preparation message. The launcher copies progress without accessing
+the provider on the UI thread. A zero report result requests cancellation.
+Check it between bounded work units and before publishing output bindings, and
+retain the previous verified cache on failure or cancellation. Cancel and close
+join the owned worker; cancellation always suppresses launch. Legacy providers
+keep their existing callback and completion behavior.
+
 Hosted-lobby, LAN, and direct netplay launches never call the normal `commit()`.
 If supplied, `commit_netplay()` should clear any in-session mod plan without
 changing the user's persisted offline selection. If it is `NULL`, recomp-ui
@@ -471,6 +506,10 @@ snesrecomp `docs/RECOMP_NET.md` → "Soft-return rematch checklist".
   widescreen 16:9 with an optional "extra cells / side" stepper (Genesis),
   texture filtering, antialiasing (Off/2×/4×/8×), screen model, frame
   interpolation, and more — each shown only when the console exposes it.
+  Which of these may be Settings rows at all is fixed for every console by
+  [docs/SETTINGS_STANDARD.md](docs/SETTINGS_STANDARD.md): Settings is PC/system
+  only, picture/sound/play changes are mods, and that file tracks each
+  console's remaining migration items.
 - **Save** — SRAM Import/Clear (with `.bak` backup) or PS1 memory cards (per-slot
   enable, Browse / New-formats-a-blank-card, real block-usage grid via the host
   `memcard_inspect` callback).
@@ -626,7 +665,13 @@ LNG_VARIANT=genesis ./build/recomp-ui-launcher
 [`src/launcher_debug.h`](src/launcher_debug.h)).
 
 Requires SDL3 (`find_package(SDL3 CONFIG)`) by default, OpenGL, and a C++17
-compiler. Configure with `-DSNESRECOMP_SDL_BACKEND=SDL2` to exercise the
+compiler.
+
+On Windows, `recomp_target_launcher_ui()` embeds `windows/recomp_utf8.manifest`
+in the executable (unless the host already embeds a manifest). It sets the
+process code page to UTF-8, so the UTF-8 paths the pickers return open through
+`fopen` and `std::filesystem` alike, including folders such as `Recompilé`.
+Windows older than 10 1903 ignores it, and the launcher logs a warning. Configure with `-DSNESRECOMP_SDL_BACKEND=SDL2` to exercise the
 supported SDL2 fallback.
 
 ---
